@@ -75,6 +75,43 @@ def _update_kernel(current, next_state, width, height, birth_rules_array, surviv
             next_state[i, j] = 1 if birth_rules_array[neighbors] else 0
 
 @cuda.jit
+def _update_kernel_3d(current, next_state, width, height, depth, birth_rules_array, survival_rules_array):
+    """
+    CUDA kernel for 3D Game of Life with configurable rules.
+    
+    Args:
+        current: Current 3D state grid (device array)
+        next_state: Next 3D state grid (device array) 
+        width, height, depth: Grid dimensions
+        birth_rules_array: Array where birth_rules_array[i] = 1 if i neighbors cause birth
+        survival_rules_array: Array where survival_rules_array[i] = 1 if i neighbors allow survival
+    """
+    # Get thread position in 3D
+    i, j, k = cuda.grid(3)
+    
+    if i < depth and j < height and k < width:
+        # Count living neighbors in 3D (26 neighbors in Moore neighborhood)
+        neighbors = 0
+        for di in range(-1, 2):
+            for dj in range(-1, 2):
+                for dk in range(-1, 2):
+                    if di == 0 and dj == 0 and dk == 0:
+                        continue  # Skip center cell
+                    ni = (i + di) % depth
+                    nj = (j + dj) % height
+                    nk = (k + dk) % width
+                    neighbors += current[ni, nj, nk]
+        
+        # Apply rules using array lookup
+        current_cell = current[i, j, k]
+        if current_cell == 1:
+            # Living cell - check survival rules
+            next_state[i, j, k] = 1 if survival_rules_array[neighbors] else 0
+        else:
+            # Dead cell - check birth rules  
+            next_state[i, j, k] = 1 if birth_rules_array[neighbors] else 0
+
+@cuda.jit
 def lut_kernel(curr, nxt, offs_y, offs_x, truth):
     """
     CUDA kernel for lookup-table based cellular automaton.
@@ -197,6 +234,120 @@ class CUDAGameOfLife(BaseSimulator):
     def seeds(cls, width: int, height: int, **kwargs):
         """Create Seeds variant (B2/S).""" 
         return cls(width, height, frozenset({2}), frozenset(), **kwargs)
+
+class CUDA3DGameOfLife(BaseSimulator):
+    """
+    GPU-accelerated 3D Game of Life with configurable rules.
+    
+    Uses CUDA kernels for parallel computation with configurable birth and survival rules.
+    Supports toroidal (wraparound) boundary conditions.
+    """
+    
+    def __init__(self, width: int, height: int, depth: int, 
+                 birth_rules: FrozenSet[int] = frozenset({3}),
+                 survival_rules: FrozenSet[int] = frozenset({2, 3}),
+                 threads_per_block: Tuple[int, int, int] = (8, 8, 8)):
+        """
+        Initialize CUDA 3D Game of Life simulator.
+        
+        Args:
+            width, height, depth: Grid dimensions
+            birth_rules: Set of neighbor counts that cause birth (default: {3})
+            survival_rules: Set of neighbor counts that allow survival (default: {2, 3})
+            threads_per_block: CUDA thread block size
+        """
+        super().__init__(width, height)
+        self.depth = depth
+        self.birth_rules = birth_rules
+        self.survival_rules = survival_rules
+        self.threads_per_block = threads_per_block
+        
+        # Print GPU information for verification
+        self._print_gpu_info()
+        
+        # Calculate grid dimensions for CUDA launch
+        self.blocks_per_grid = (
+            (depth + threads_per_block[0] - 1) // threads_per_block[0],
+            (height + threads_per_block[1] - 1) // threads_per_block[1],
+            (width + threads_per_block[2] - 1) // threads_per_block[2]
+        )
+        
+        print(f"CUDA 3D Grid Configuration:")
+        print(f"  Threads per block: {threads_per_block}")
+        print(f"  Blocks per grid: {self.blocks_per_grid}")
+        print(f"  Total threads: {np.prod(threads_per_block) * np.prod(self.blocks_per_grid)}")
+        print(f"  Grid cells: {width * height * depth}")
+        
+        # Pre-compute rule arrays and move to GPU memory (PERFORMANCE OPTIMIZATION)
+        max_neighbors = 26
+        birth_rules_array = np.zeros(max_neighbors + 1, dtype=np.uint8)
+        survival_rules_array = np.zeros(max_neighbors + 1, dtype=np.uint8)
+        
+        for rule in birth_rules:
+            birth_rules_array[rule] = 1
+        for rule in survival_rules:
+            survival_rules_array[rule] = 1
+        
+        # Move rule arrays to GPU memory once during initialization
+        self.d_birth_rules = cuda.to_device(birth_rules_array)
+        self.d_survival_rules = cuda.to_device(survival_rules_array)
+        print(f"  Rule arrays moved to GPU memory")
+        
+        # Initialize device arrays
+        self.d_current = None
+        self.d_next = None
+        self.reset()
+    
+    def _print_gpu_info(self):
+        """Print GPU information for verification."""
+        try:
+            from numba import cuda
+            print(f"GPU Verification:")
+            print(f"  CUDA available: {cuda.is_available()}")
+            if cuda.is_available():
+                gpu = cuda.get_current_device()
+                print(f"  GPU device: {gpu.name.decode()}")
+                print(f"  Compute capability: {gpu.compute_capability}")
+                print(f"  Total memory: {gpu.total_memory / (1024**3):.1f} GB")
+                
+                # Get memory info
+                meminfo = cuda.current_context().get_memory_info()
+                used_mb = (meminfo.total - meminfo.free) / (1024**2)
+                total_mb = meminfo.total / (1024**2)
+                print(f"  GPU memory used: {used_mb:.1f} MB / {total_mb:.1f} MB")
+            else:
+                print("  WARNING: CUDA not available - falling back to CPU!")
+        except Exception as e:
+            print(f"  Error checking GPU info: {e}")
+    
+    def step(self) -> None:
+        """Perform one simulation step using CUDA kernel."""
+        # No more array creation or host-to-device transfers!
+        _update_kernel_3d[self.blocks_per_grid, self.threads_per_block](
+            self.d_current, self.d_next, self.width, self.height, self.depth,
+            self.d_birth_rules, self.d_survival_rules
+        )
+        # Swap buffers
+        self.d_current, self.d_next = self.d_next, self.d_current
+    
+    def get_state(self) -> np.ndarray:
+        """Get current state as numpy array."""
+        return self.d_current.copy_to_host()
+    
+    def reset(self, initial_state: Optional[np.ndarray] = None) -> None:
+        """Reset simulation with random or provided initial state."""
+        if initial_state is None:
+            # Create random initial state (50% alive)
+            initial_state = np.random.choice([0, 1], size=(self.depth, self.height, self.width), p=[0.5, 0.5])
+        
+        # Ensure correct data type and shape
+        initial_state = initial_state.astype(np.uint8)
+        if initial_state.shape != (self.depth, self.height, self.width):
+            raise ValueError(f"Initial state shape {initial_state.shape} doesn't match grid ({self.depth}, {self.height}, {self.width})")
+        
+        # Copy to GPU
+        self.d_current = cuda.to_device(initial_state)
+        self.d_next = cuda.device_array_like(self.d_current)
 
 class CPUGameOfLife(BaseSimulator):
     """CPU-based Game of Life using NumPy."""
